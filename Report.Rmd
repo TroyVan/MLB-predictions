@@ -1,0 +1,390 @@
+---
+title: "Bayesian Probabilistic Forecast of MLB Games"
+author: "Troy Van"
+date: "2019-04-27"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, error = FALSE, message = FALSE, warning = FALSE)
+library(boot)
+library(plyr)
+library(dplyr)
+library(gbm)
+library(ggplot2)
+library(readr)
+library(rjags)
+
+load("Complete 2019-04-27.RData")
+```
+
+It's the end of the seventh inning in a MLB game, with the score 5 to 2 in favor of the visiting team. A large portion of the fans in attendence starts to head for the exits, thinking that the chance of a home win is slim. Are they justified in thst belief? Whatever our gut feeling is as to how close a game is and how likely a comeback will be, it is likely riddled with biases. Thus it pays to have a method, grounded in data, to forecast the win probability for each team, so that we have an informed idea of how close the game is, and how surprised we should be when the home team scores five in the ninth for a walk-off win.
+
+Below we propose a method to forecast, during a Major League Baseball game, the chance of the home team winning the game, from the state of the game, including the inning, the score, and other information as appropriate.
+
+## Data description
+
+The source data is the [game logs](https://www.retrosheet.org/gamelogs/index.html) of 2018 Season MLB games provided by [Retrosheet](https://www.retrosheet.org/). The game log for each game contains 161 fields of information, including the teams, the final score, the lineups, team statistics, and more. Central to our present purpose is the line score, which shows the number of runs scored by each team in each inning. For example, the line score for the Opening Day game in 2018 between Colorado and Arizona is as follows:
+
+Inn.|1|2|3|4|5|6|7|8|9|R
+----|-|-|-|-|-|-|-|-|-|-
+COL |1|0|0|0|0|1|0|0|0|2
+ARI |3|0|0|0|0|3|2|0|x|8
+
+In this game, Colorado scored one run in the first inning, and one in the sixth, for a total of 2 runs. Arizona scored three runs in the first inning, three in the sixth, two in the seventh, and won 8 - 2. They did not bat in the ninth inning because they were leading after Colorado had finished batting.
+
+From this line score we derive a series of game states, each at the end of an inning except the last. Each game state reflects the state of the game at a particular point in time, and include the visitor and home score at that point, the difference in score (positive means the home team is ahead), and the number of innings completed. It also includes an indication whether the home team went on to win the game, for our use in forecasting. Also, a game state is generated for the start of the game, indicating no score on either team, no inning completed, and the eventural winning team. Thus, the game states generated for the above example game are as follows:
+
+```{r}
+gamestates[1:9,]
+```
+
+We only include qualified games into our database. For a game to qualify, it must not be rain-shortened or forfeited, it must not end in a tie, and information on the game must be complete. Information used to determine these qualifications are in the game logs.
+
+These game states, not the raw game logs, will be used in further analysis.
+
+To test our method, we also produce a set of test game states from early-season 2019 games from Opening Day through mid-April. The line scores were copied from the scores posted on [MLB.com](https://www.mlb.com/scores), and game states were produced from these line scores.
+
+## Data visualizations
+
+### Distribution of score difference
+
+```{r}
+ggplot(gamestates, aes(diff)) +
+  geom_bar() +
+  labs(x = "Score difference", y = "Count", title = "Distribution of score difference")
+```
+
+The distribution of the score difference is approximately symmetric, with a sharp peak at zero. It looks more like a two-sided exponential curve than a Normal bell curve.
+
+### Chance of winning by score difference
+
+```{r}
+ggplot(gamestates, aes(diff, fill = homeWin)) +
+  geom_bar(position = "fill") +
+  labs(x = "Score difference", y = "Frequency", title = "Chance of winning by score difference")
+```
+
+As would be expected, the team leading in score is favored to win, and the effect of a run is on a team's chance of winning is the greatest when the score is close. When the score is level, the home team is slightly favored to win.
+
+### Chance of winning by inning and score difference
+
+```{r}
+breakdown = count(gamestates, innings, diff)
+
+breakdown$homeWins = rep(0, nrow(breakdown))
+
+for(i in 1:nrow(breakdown)) {
+  breakdown$homeWins[i] = nrow(filter(gamestates,
+                                      innings == breakdown$innings[i],
+                                      diff == breakdown$diff[i],
+                                      homeWin == TRUE
+                                      ))
+}
+
+breakdown$hprob = breakdown$homeWins / breakdown$n
+
+ggplot(filter(breakdown, n > 29), aes(x = innings, y = hprob, group = diff, color = diff)) +
+  geom_line() +
+  labs(
+    x = "Innings completed",
+    y = "Frequency of home win",
+    title = "Chance of winning by inning and score difference",
+    subtitle = "Minimum sample size of 30",
+    color = "Score difference"
+  )
+```
+
+This graph only includes inning and score difference combinations that occur at least 30 times in our database. The team in the lead has a greater chance of winning the deeper into the game. When the game is tied, the home team is usually slightly favored. (Because a game can go past the 9th inning only if the score is tied, only the line for a tied score goes beyond 8 innings.)
+
+## General methodology
+
+We use a hierarchical Bayesian model where $p$, the chance of a home win at a given situation is given by a formula combining the explanatory variables used in the model. The coefficients associated with the variables a given a vague prior distribution, reflecting our lack of prior understanding about what the values of the coefficients should be. Then we run the model through a Markov chain Monte Carlo simulation, which produces an approximation of a random sample of the coefficients drawn from the posterior distribution of the coefficients. This sample will give us a sense of what the coefficients are likely to be.
+
+From this sample we produce a prediction of the home team's winning chances for each game state in the test set. These predictions are evaluated with two tools:
+
+**Calibration**: Whether events given a certain probability occur at the expected frequency; e.g. outcomes forecasted at 70% probability should occur routhly 70% of the time. A graph is produced plotting the predicted probability of home win against the actual observed frequency of home win: ideally it should stay close to the $y = x$ line, but a certain amount of deviations are to be expected, especially where the number of predictions is low.
+
+**[Brier score](https://doi.org/10.1175/1520-0493(1950)078%3C0001:VOFEIT%3E2.0.CO;2)**, a metric measuring both the accuracy and the certainty of predictions. For binary predictions, the Brier score is:
+
+$$
+\frac{1}{n}\sum_{i = 1}^n(p_i - Y_i)^2
+$$
+
+Where $p_i$ is the predicted probability for event $i$, and $Y_i$ is an indicator whether the event actually happens ($1$ if it does, $0$ if not). Thus the score is simply a mean squared error. It ranges between $0$ and $1$, and low scores are better. For example:
+
+* if the predicted probability is $.5$, the prediction will result in a $.25$ Brier score whether or not the event occurs;
+* if the predicted probability is $.9$ and the event occurs, the prediction results in a $.01$ Brier score;
+* if the predicted probability is $.9$ and the event does not occur, the prediction results in a $.81$ Brier score.
+
+Brier scores will be compared among the various models we will try out as well as "naive" models that gives as the winning probability the historical frequency of wins from the given state.
+
+## Models
+
+### Model 1: using difference
+
+Response variable:
+
+* $Y$, a binary variable indicating the winning team (0 for visitor win, 1 for home win)
+
+Explanatory variable:
+
+* $X$ is the difference in score (negative for visitor lead, positive for home lead)
+
+Coefficients:
+
+* $p$ is the probability of home win in a given state. It is calculated from $X$, $b_0$, and $b_1$.
+* $b_0$ represents the home field advantage effect.
+* $b_1$ represents the effect of a run.
+
+$$
+Y | X, b_0, b_1 \sim Bern(p)\\
+log(\frac{p}{1 - p}) | X, b_0, b_1 = b_0 + b_1 X\\
+b_0, b_1 \sim N(0, 100)
+$$
+
+#### Posterior distribution of coefficients
+
+| Coefficient | Mean | Standard deviation | 2.5th percentile | 1st quatile | Median | 3rd quatile | 97.5th percentile |
+|-------------|--------|--------------------|------------------|-------------|--------|-------------|-------------------|
+| b0 | .06685 | .01672 | .03439 | .05545 | .06675 | .07823 | .09968 |
+| b1 | .71804 | .01141 | .69602 | .71019 | .71809 | .72573 | .74025 |
+
+```{r}
+ggplot(model_1_chains, aes(x = b0)) +
+  geom_density()
+ggplot(model_1_chains, aes(x = b1)) +
+  geom_density()
+ggplot(M1, aes(x = diff, y = p)) +
+  geom_line() +
+  labs(
+    x = "Score difference",
+    y = "Estimated probability of home win"
+  )
+```
+
+As expected, the score difference has a positive relationship with the probability of a home win, and there is a slight home field advantage.
+
+#### Calibration
+
+```{r}
+calibrate.plot(teststates$homeWin,teststates$M1, shade.col = "lightblue")
+```
+
+The model appears to be well-calibrated.
+
+#### Brier score
+
+The Brier score for model 1 is $.1742190$.
+
+#### Naive model 1
+
+Naive model 1 gives, as the probability of a home win given a score difference, the frequency of home wins given that score difference in our dataset. The Brier score for naive model 1 is $.1747114$, so our Baeyesian model is performing better.
+
+### Model 2: using difference and inning
+
+Response variable:
+
+* $Y$, a binary variable indicating the winning team (0 for visitor win, 1 for home win).
+
+Explanatory variables:
+
+* $X$, the difference in score (negative for visitor lead, positive for home lead).
+* $T$, the number of innings elapsed.
+
+Coefficients:
+
+* $p$, the probability of home win in a given state. It is calculated from the explanatory variables and the other coefficients.
+* $b_0$ represents the home field advantage effect.
+* $b_1$ represents the effect of a run.
+* $b_2$ represents the effect of time in the form of innings elapsed.
+* $b_3$ represents the extent to which the effect of a run is scaled by the number of innings played.
+
+$$
+Y | X, b_0, b_1, b_2, b_3 \sim Bern(p)\\
+log(\frac{p}{1 - p}) | X, b_0, b_1, b_2, b_3 = b_0 + b_1 X + b_2T + b_3XT\\
+b_0, b_1, b_2, b_3 \sim N(0, 100)
+$$
+
+In this model we hope to recreate the plot shown in "Chance of winning by inning and score difference", earlier.
+
+#### Posterior distribution of coefficients
+
+| Coefficient | Mean | Standard deviation | 2.5th percentile | 1st quatile | Median | 3rd quatile | 97.5th percentile |
+|-------------|---------|--------------------|------------------|-------------|---------|-------------|-------------------|
+| b0 | .08604 | .02614 | .03484 | .06871 | .08590 | .10344 | .13724 |
+| b1 | .27446 | .02528 | .22629 | .25720 | .27434 | .29096 | .32490 |
+| b2 | -.00464 | .00606 | -.01662 | -.00872 | -.00455 | -.00051 | .00708 |
+| b3 | .09968 | .00565 | .08846 | .09590 | .09972 | .10350 | .11038 |
+
+```{r}
+ggplot(model_2_chains, aes(x = b0)) +
+  geom_density()
+ggplot(model_2_chains, aes(x = b1)) +
+  geom_density()
+ggplot(model_2_chains, aes(x = b2)) +
+  geom_density()
+ggplot(model_2_chains, aes(x = b3)) +
+  geom_density()
+ggplot(M2, aes(x = innings, y = p, group = diff, color = diff)) +
+  geom_line() +
+  labs(
+    x = "Innings completed",
+    y = "Estimated probability of home win",
+    color = "Score difference"
+  )
+```
+
+As expected, $b_3$ is positive, meaning that the effect of score difference increases in later innings where the trailing team have fewer chances to catch up.
+
+$b_2$ is likely negative, meaning that the home field advantage lessens as time goes on. Home field advantage is partly the expectation that the home team tends to score more, so as innings go by, increasing portions of that expectation materalizes into runs, and the remaining expectation is less. Another part of the home field advantage rests in the fact that the home team bats second, and so will have the knowledge of the runs scored by the visiting team and thus the score needed to win, and can strategize accordingly. This explains why some home field advantage still remains after 8 innings. However, this trend is not conclusive, as from our distribution there is still a 22% chance that $b_2$ is positive.
+
+#### Calibration
+
+```{r}
+calibrate.plot(teststates$homeWin,teststates$M2, shade.col = "lightblue")
+```
+
+The model appears to be well-calibrated.
+
+#### Brier score
+
+The Brier score for model 2 is $.1717639$, better than that for model 1.
+
+#### Naive model 2
+
+Naive model 2 gives, as the probability of a home win given a score difference, the frequency of home wins among game states with the same score difference and inning combination in our dataset. The Brier score for naive model 2 is $.1719983$, so our Baeyesian model is performing better.
+
+### Model 2B: are extra innings different?
+
+To investigate whether different coefficients prevail in extra innings than overall, we re-run model 2 with only the extra inning states, and then compare the coefficients and evaluation metrics with those of model 2.
+
+Note that because extra innings always start with the score tied, the score difference is always $0$, so coefficients $b_1$ and $b_3$ do not apply.
+
+#### Posterior distribution of coefficients
+
+| Coefficient | Mean | Standard deviation | 2.5th percentile | 1st quatile | Median | 3rd quatile | 97.5th percentile |
+|-------------|--------|--------------------|------------------|-------------|--------|-------------|-------------------|
+| b0 | .02195 | .65037 | -1.1719 | -.42580 | .00378 | .47092 | 1.3146 |
+| b2 | .01676 | .06376 | -.1087 | -.02713 | .01916 | .06094 | .1349 |
+
+```{r}
+ggplot(model_2B_chains, aes(x = b0)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b0), color = "red")
+ggplot(model_2B_chains, aes(x = b2)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b2), color = "red")
+ggplot(M2B, aes(x = innings, y = p)) +
+  geom_line() +
+  ylim(0, 1) +
+  labs(
+    x = "Innings completed",
+    y = "Estimated probability of home win"
+  )
+```
+
+*Note: Black line is for model 2B, red line is for model 2.*
+
+Unfortunately there are only $466$ extra innings in our database, therefore the distribution of coefficients are way wider than that of model 2, making it hard to say what the coefficients are in extra innings or whether they are different than those in general.
+
+#### Calibration
+
+```{r}
+calibrate.plot(extraInnTestStates$homeWin,extraInnTestStates$M2B, shade.col = "lightblue")
+```
+
+The model appears to be poorly calibrated; however, this is likely due to the small size of the extra inning test set (only $34$ extra innings).
+
+#### Brier score
+
+The Brier score for model 2B is $.2689747$. Astonishingly, model 2B performs worse than a flat prediction scheme which gives even odds to every extra inning, which would have a Brier score of $.25$. This model is also worse than model 2, which earns a Brier score of $.2540656$ in extra innings (also worse than 50/50 predictions).
+
+### Model 2C: treating extras as 9th innings
+
+Model 2 still has a slight weakness regarding extra innings: as $b_2$ is mostly negative, in very long games the home field advantage might turn into home field *dis*anvantage, an undesiriable consequence. Therefore here we tweak model 2 so that extra innings are treated as 9th innings. The formulas stay the same; only the data need to be modified.
+
+Why 9th inning? As far as game mechanics are concerned, an extra inning is just like the ninth inning with the scoe tied: whichever team scores more runs in this one inning wins, the home team wins immediately upon scoring to take the lead, and should the score be tied at the end of the inning, another is played. However, extra innings, especially deep extra innings, are arguably different in that players are more fatigued and the benches and bullpens will be running short on substitutes. Regrettably, because extra innings are few and far between (even more so for deep innings), we have insufficient data to quantify such differences, so it may be better to ignore the extra inning aspect to stablize the model.
+
+#### Posterior distribution of coefficients
+
+| Coefficient | Mean | Standard deviation | 2.5th percentile | 1st quatile | Median | 3rd quatile | 97.5th percentile |
+|-------------|---------|--------------------|------------------|-------------|---------|-------------|-------------------|
+| b0 | .09264 | .02707 | .03880 | .07420 | .09244 | .11077 | .14632 |
+| b1 | .27558 | .02572 | .22486 | .25820 | .27580 | .29309 | .32531 |
+| b2 | -.00677 | .00651 | -.01941 | -.01123 | -.00676 | -.00240 | .00597 |
+| b3 | .09944 | .00574 | .08851 | .09547 | .09938 | .10329 | .11091 |
+
+```{r}
+ggplot(model_2C_chains, aes(x = b0)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b0), color = "red")
+ggplot(model_2C_chains, aes(x = b1)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b1), color = "red")
+ggplot(model_2C_chains, aes(x = b2)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b2), color = "red")
+ggplot(model_2C_chains, aes(x = b3)) +
+  geom_density() +
+  geom_density(data = model_2_chains, mapping = aes(x = b3), color = "red")
+ggplot(M2C, aes(x = innings, y = p, group = diff, color = diff)) +
+  geom_line() +
+  labs(
+    x = "Innings completed",
+    y = "Estimated probability of home win",
+    color = "Score difference"
+  )
+```
+
+*Note: Black line is for model 2C, red line is for model 2.*
+
+Under model 2C, home field advantage both starts a bit bigger and declines a bit more quickly than under model 2. Also, the distribution of $b_2$ and $b_3$ have flattened somewhat (i.e. not as precise) compared to model 2.
+
+#### Calibration
+
+```{r}
+calibrate.plot(teststates$homeWin,teststates$M2C, shade.col = "lightblue")
+```
+
+This model appears to be well-calibrated.
+
+#### Brier score
+
+Model 2C logs the best Brier score yet, at $.1717165$, and the best extra-inning score of $.2529654$. This is evidence that treating extra innings as 9th innings improves the predictions.
+
+### Summary of Brier scores
+
+| Model | Brier score |
+|----------------------|-------------|
+| Naive 1 | .1747114 |
+| Model 1 | .1742190 |
+| Naive 2 | .1719983 |
+| Model 2 | .1717639 |
+| Model 2 (in extras) | .2540656 |
+| Model 2B (in extras) | .2689747 |
+| Model 2C | .1717165 |
+| Model 2C (in extras) | .2529654 |
+
+Model 2C is the best model by Brier score, both in general and in extra innings. However, it still performs worse than an even-odds prediction in extra innings, so it may be better to treat extra innings as 50/50 affairs instead.
+
+## What the model tells us
+
+A one-run game in the ninth inning is far from a sure win for the leading team: there is roughly a 1 in 4 chance that the traing team will come back to win, similar as a 2-run game after 4 innings or a 3-run game after 1. There is a roughly 5% chance of a comeback win from down 3 after seven innings, or from down 4 after 5.
+
+So sometimes leaving early may be wise, as che chance of a upset is slim. On the other hand, it is those comebacks that overcome long odds that will reward those still in the stands the most. Ultimately, there's always a chance of winning, even when down ten runs in the ninth inning with two outs, unlike other sports where it's physically impossible to score three touchdowns in ten seconds or five baskets in ten seconds.
+
+## Next steps
+
+A big disadvantage of this model is that it only produces a prediction between innings. A bigger model may provide a prediction in the middle of an inning; a even bigger model may run after every plate appearance, runner advancement, or out, incorporating the number of outs and the position of runners, using game states compiled from play-by-play data. Also, it may be helpful to investigate whether including more previous seasons will be of help. Obviously having more data is good, but because the game if baseball is constantly changing (more so in this digital, Statcast era), it may be argued that years-old games may not be representative of the game today.
+
+## References
+
+The game log data is found on [Retrosheet](https://www.retrosheet.org/gamelogs/index.html), which mandates the following notice be included as a condition for using its database:
+```
+The information used here was obtained free of charge from and is copyrighted by Retrosheet.  Interested parties may contact Retrosheet at "www.retrosheet.org".
+```
+
+The Brier score was proposed by by Glenn W. Brier in the article "Verification of Forecasts Expressed in Terms of Probability", published in Monthly Weather Review in January 1950 (Vol 78, No. 1, pp. 1-3), [doi:10.1175/1520-0493(1950)078<0001:VOFEIT>2.0.CO;2](https://doi.org/10.1175/1520-0493(1950)078%3C0001:VOFEIT%3E2.0.CO;2)
+
+Java 8 was used to produce the game states from the line scores; R 3.5.1 was used for data analysis with the game states. The following R packages were used: `boot, plyr, dplyr, gbm, ggplot2, readr, rjags`.
